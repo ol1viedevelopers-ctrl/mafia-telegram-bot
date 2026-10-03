@@ -1,8 +1,8 @@
 import html
-import json
 import logging
 import os
 import random
+import sqlite3
 import sys
 import threading
 import time
@@ -11,7 +11,10 @@ from enum import Enum
 from typing import Optional
 
 import telebot
+from dotenv import load_dotenv
 from telebot import types
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,12 +27,14 @@ logging.basicConfig(
 log = logging.getLogger("mafia")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+DB_PATH = "mafia_stats.db"
+OLD_STATS_FILE = "stats.json"
+
 MIN_PLAYERS = 3
 LOBBY_TIMEOUT = 60
 NIGHT_TIMEOUT = 90
 NIGHT_TIMEOUT_SHORT = 45
 VOTE_TIMEOUT = 90
-STATS_FILE = "stats.json"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 
@@ -206,6 +211,96 @@ GAMES_LOCK = threading.Lock()
 MEMBER_CACHE = {}
 MEMBER_CACHE_LOCK = threading.Lock()
 SEND_LOCK = threading.Lock()
+DB_LOCK = threading.Lock()
+
+
+def db_connect():
+    return sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
+
+
+def init_db():
+    with DB_LOCK:
+        with db_connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS players (
+                    user_id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    games INTEGER NOT NULL DEFAULT 0,
+                    wins INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            conn.commit()
+    migrate_old_stats()
+
+
+def migrate_old_stats():
+    if not os.path.exists(OLD_STATS_FILE):
+        return
+    try:
+        import json
+        with open(OLD_STATS_FILE, encoding="utf-8") as f:
+            old = json.load(f)
+    except Exception as e:
+        log.warning(f"migrate: не удалось прочитать stats.json: {e}")
+        return
+
+    with DB_LOCK:
+        with db_connect() as conn:
+            for key, data in old.items():
+                try:
+                    uid = int(key)
+                except ValueError:
+                    continue
+                name = data.get("name", f"Игрок_{uid}")
+                games = int(data.get("games", 0))
+                wins = int(data.get("wins", 0))
+                conn.execute("""
+                    INSERT INTO players (user_id, name, games, wins)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        name = excluded.name,
+                        games = MAX(players.games, excluded.games),
+                        wins = MAX(players.wins, excluded.wins)
+                """, (uid, name, games, wins))
+            conn.commit()
+
+    try:
+        os.rename(OLD_STATS_FILE, OLD_STATS_FILE + ".migrated")
+    except OSError:
+        pass
+    log.info("stats.json перенесён в SQLite")
+
+
+def add_win(uid, name, won):
+    try:
+        with DB_LOCK:
+            with db_connect() as conn:
+                conn.execute("""
+                    INSERT INTO players (user_id, name, games, wins)
+                    VALUES (?, ?, 1, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        name = excluded.name,
+                        games = players.games + 1,
+                        wins = players.wins + excluded.wins
+                """, (uid, name, 1 if won else 0))
+                conn.commit()
+    except sqlite3.Error as e:
+        log.warning(f"add_win: {e}")
+
+
+def top_players(limit=10):
+    try:
+        with DB_LOCK:
+            with db_connect() as conn:
+                cur = conn.execute(
+                    "SELECT name, wins, games FROM players "
+                    "ORDER BY wins DESC, games DESC LIMIT ?",
+                    (limit,),
+                )
+                return cur.fetchall()
+    except sqlite3.Error as e:
+        log.warning(f"top_players: {e}")
+        return []
 
 
 def balance(n):
@@ -236,35 +331,6 @@ def balance(n):
     result = list(required) + picked[:need]
     random.shuffle(result)
     return result
-
-
-def load_stats():
-    try:
-        with open(STATS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        log.debug(f"stats load: {e}")
-        return {}
-
-
-def save_stats(s):
-    try:
-        with open(STATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False, indent=1)
-    except OSError as e:
-        log.warning(f"stats save: {e}")
-
-
-def add_win(uid, name, won):
-    s = load_stats()
-    key = str(uid)
-    if key not in s:
-        s[key] = {"name": name, "wins": 0, "games": 0}
-    s[key]["name"] = name
-    s[key]["games"] += 1
-    if won:
-        s[key]["wins"] += 1
-    save_stats(s)
 
 
 def send(chat_id, text, thread_id=None, kb=None):
@@ -321,7 +387,9 @@ def bot_can_delete(chat_id):
     try:
         me = bot.get_me()
         m = bot.get_chat_member(chat_id, me.id)
-        return bool(getattr(m, "can_delete_messages", False)) or m.status == "creator"
+        if m.status == "creator":
+            return True
+        return bool(getattr(m, "can_delete_messages", False))
     except Exception as e:
         log.debug(f"bot_can_delete: {e}")
         return False
@@ -510,8 +578,12 @@ def start_game(chat_id, message=None, call_id=None, auto=False):
         f"{header}\n🏙️ <b>ГОРОД ЗАСЫПАЕТ</b>\n\n👥 Участники ({n}):\n{roster}\n\n"
         "📩 Роли в ЛС. Открой бота!\n\n🌙 <b>Ночь #{g.night}</b>",
     )
-    distribute_roles(g)
+    distribute_roles_async(g)
     start_night(g)
+
+
+def distribute_roles_async(g):
+    threading.Thread(target=distribute_roles, args=[g], daemon=True).start()
 
 
 def distribute_roles(g):
@@ -699,6 +771,9 @@ def resolve_target_id(raw):
 def night_action(call):
     uid = call.from_user.id
     parts = call.data.split(":")
+    if len(parts) < 3:
+        bot.answer_callback_query(call.id)
+        return
     action = parts[1]
     target_id = resolve_target_id(parts[2])
     param = parts[3] if len(parts) > 3 else ""
@@ -783,6 +858,9 @@ def night_action(call):
                 edit(call, "Ты уже сделал ход.")
 
         elif action == "sh2":
+            if p.extra.get("sheriff_used", 0) >= 2:
+                bot.answer_callback_query(call.id, "Вторая проверка уже закрыта.")
+                return
             p.target_check2 = target_id
             p.extra["sheriff_used"] = 2
             if tp:
@@ -858,7 +936,11 @@ def alch_choose(call):
             return
         alive = g.alive()
 
-    potion = call.data.split(":")[1]
+    parts = call.data.split(":")
+    if len(parts) < 2:
+        bot.answer_callback_query(call.id)
+        return
+    potion = parts[1]
     if potion == "save":
         if not p.has_save:
             bot.answer_callback_query(call.id, "Израсходовано!", show_alert=True)
@@ -917,23 +999,6 @@ def _resolve_night_impl(g):
             tp.lawyer_target = None
             send(tp.user_id, "💋 Любовница была у тебя. Ход пропущен.")
 
-    mafia = [p for p in alive if p.role in (Role.DON, Role.CUTTHROAT)]
-    don = next((p for p in mafia if p.role == Role.DON), None)
-    kill_target = None
-    killer_name = "Мафия"
-
-    if don and don.user_id not in blocked and don.target_kill:
-        kill_target = don.target_kill
-        killer_name = f"Дон {don.plain()}"
-    else:
-        votes = [m.target_kill for m in mafia if m.user_id not in blocked and m.target_kill]
-        if votes:
-            kill_target = max(set(votes), key=votes.count)
-            for m in mafia:
-                if m.user_id not in blocked and m.target_kill == kill_target:
-                    killer_name = m.plain()
-                    break
-
     doctor = next((p for p in alive if p.role == Role.DOCTOR), None)
     if doctor and doctor.user_id not in blocked and doctor.target:
         tp = g.get(doctor.target)
@@ -950,22 +1015,6 @@ def _resolve_night_impl(g):
     bg_target = None
     if bodyguard and bodyguard.user_id not in blocked:
         bg_target = bodyguard.target
-
-    if kill_target:
-        victim = g.get(kill_target)
-        if victim and victim.alive:
-            if bodyguard and bg_target == victim.user_id:
-                bodyguard.alive = False
-                deaths.append(bodyguard)
-                for w in [p for p in alive if p.role == Role.WITNESS and p.user_id not in blocked]:
-                    if w.target == victim.user_id:
-                        witness_reports.append((w.user_id, killer_name))
-            elif not victim.protected:
-                victim.alive = False
-                deaths.append(victim)
-                for w in [p for p in alive if p.role == Role.WITNESS and p.user_id not in blocked]:
-                    if w.target == victim.user_id:
-                        witness_reports.append((w.user_id, killer_name))
 
     for p in alive:
         if p.role != Role.COMMISSAR or not p.commissar_shot:
@@ -987,6 +1036,39 @@ def _resolve_night_impl(g):
             send_game(g, f"🔫 <b>НОЧНОЙ ВЫСТРЕЛ!</b> {shot_target.disp()} найден мёртвым.")
         else:
             send(p.user_id, f"🔫 Ты выстрелил в {shot_target.disp()}, но он оказался мирным.")
+
+    mafia = [p for p in alive if p.role in (Role.DON, Role.CUTTHROAT)]
+    don = next((p for p in mafia if p.role == Role.DON), None)
+    kill_target = None
+    killer_name = "Мафия"
+
+    if don and don.user_id not in blocked and don.target_kill:
+        kill_target = don.target_kill
+        killer_name = f"Дон {don.plain()}"
+    else:
+        votes = [m.target_kill for m in mafia if m.user_id not in blocked and m.target_kill]
+        if votes:
+            kill_target = max(set(votes), key=votes.count)
+            for m in mafia:
+                if m.user_id not in blocked and m.target_kill == kill_target:
+                    killer_name = m.plain()
+                    break
+
+    if kill_target:
+        victim = g.get(kill_target)
+        if victim and victim.alive:
+            if bodyguard and bg_target == victim.user_id:
+                bodyguard.alive = False
+                deaths.append(bodyguard)
+                for w in [p for p in alive if p.role == Role.WITNESS and p.user_id not in blocked]:
+                    if w.target == victim.user_id:
+                        witness_reports.append((w.user_id, killer_name))
+            elif not victim.protected:
+                victim.alive = False
+                deaths.append(victim)
+                for w in [p for p in alive if p.role == Role.WITNESS and p.user_id not in blocked]:
+                    if w.target == victim.user_id:
+                        witness_reports.append((w.user_id, killer_name))
 
     for alch in [p for p in alive if p.role == Role.ALCHEMIST]:
         if alch.user_id not in blocked and alch.alch_potion == "silence" and alch.target:
@@ -1033,7 +1115,7 @@ def _resolve_night_impl(g):
             )
             try:
                 with SEND_LOCK:
-                    bot.send_message(mod.user_id, f"📋 <b>Лог ролей:</b>\n{log_text}")
+                    bot.send_message(mod.user_id, f" 📋 <b>Лог ролей:</b>\n{log_text}")
             except Exception as e:
                 log.debug(f"mod log: {e}")
 
@@ -1084,6 +1166,16 @@ def vote(call):
         bot.answer_callback_query(call.id, "Не сейчас.", show_alert=True)
         return
 
+    parts = call.data.split(":")
+    if len(parts) < 2:
+        bot.answer_callback_query(call.id)
+        return
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        bot.answer_callback_query(call.id)
+        return
+
     with g.lock:
         voter = g.get(uid)
         if not voter or not voter.alive:
@@ -1092,7 +1184,6 @@ def vote(call):
         if voter.silenced:
             bot.answer_callback_query(call.id, "🤫 Ты под Молчанием!", show_alert=True)
             return
-        target_id = int(call.data.split(":")[1])
         tp = g.get(target_id)
         if not tp or not tp.alive:
             bot.answer_callback_query(call.id, "Его уже нет.", show_alert=True)
@@ -1193,8 +1284,8 @@ def check_win(g):
         winner = Team.NEUTRAL
     elif not mafia and not psycho:
         winner = Team.CITY
-    elif not mafia and psycho and alive_total > 1:
-        pass
+    elif not mafia and psycho and not city:
+        winner = Team.NEUTRAL
     elif mafia and len(mafia) >= len(city) + len(psycho):
         winner = Team.MAFIA
 
@@ -1327,22 +1418,19 @@ def cmd_mafia_chat(message):
         text = text[:300] + "..."
     for m in g.alive():
         if m.role in (Role.DON, Role.CUTTHROAT) and m.user_id != uid:
-            try:
-                with SEND_LOCK:
-                    bot.send_message(m.user_id, f"🎩 <b>{esc(p.plain())}:</b> {esc(text)}")
-            except Exception as e:
-                log.debug(f"mafia chat: {e}")
+            send(m.user_id, f"🎩 <b>{esc(p.plain())}:</b> {esc(text)}")
     send(uid, "Отправлено союзникам.")
 
 
 @bot.message_handler(commands=["top"])
 def cmd_top(message):
-    s = load_stats()
-    if not s:
+    rows = top_players(10)
+    if not rows:
         send(message.chat.id, "Статистики пока нет.")
         return
-    rows = sorted(s.values(), key=lambda x: (-x.get("wins", 0), -x.get("games", 0)))[:10]
-    lines = [f"{i+1}. <b>{esc(r.get('name','?'))}</b> — {r.get('wins',0)}/{r.get('games',0)}" for i, r in enumerate(rows)]
+    lines = []
+    for i, (name, wins, games) in enumerate(rows):
+        lines.append(f"{i+1}. <b>{esc(name)}</b> — {wins}/{games}")
     send(message.chat.id, "🏆 <b>ТОП-10 ИГРОКОВ</b>\n\n" + "\n".join(lines))
 
 
@@ -1408,21 +1496,31 @@ def cmd_help(message):
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(call):
     d = call.data or ""
-    if d == "r":
-        register(call.message.chat.id, call.from_user, message=call.message, call_id=call.id)
-    elif d == "s":
-        start_game(call.message.chat.id, message=call.message, call_id=call.id)
-    elif d.startswith("v:"):
-        vote(call)
-    elif d.startswith("a:"):
-        alch_choose(call)
-    elif d.startswith("n:"):
-        night_action(call)
-    else:
+    try:
+        if d == "r":
+            register(call.message.chat.id, call.from_user, message=call.message, call_id=call.id)
+        elif d == "s":
+            start_game(call.message.chat.id, message=call.message, call_id=call.id)
+        elif d.startswith("v:"):
+            vote(call)
+        elif d.startswith("a:"):
+            alch_choose(call)
+        elif d.startswith("n:"):
+            night_action(call)
+        else:
+            bot.answer_callback_query(call.id)
+    except (IndexError, ValueError) as e:
+        log.warning(f"callback parse: {e} | data={d!r}")
+        try:
+            bot.answer_callback_query(call.id, "Кнопка устарела.", show_alert=False)
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception(f"callback: {e} | data={d!r}")
         try:
             bot.answer_callback_query(call.id)
-        except Exception as e:
-            log.debug(f"unknown callback: {e}")
+        except Exception:
+            pass
 
 
 def cleanup_sessions():
@@ -1444,9 +1542,10 @@ def cleanup_sessions():
 
 
 def main():
-    if not BOT_TOKEN:
-        log.error("BOT_TOKEN не задан")
+    if not BOT_TOKEN or ":" not in BOT_TOKEN:
+        log.error("BOT_TOKEN не задан или неверный. Проверь .env")
         return
+    init_db()
     threading.Thread(target=cleanup_sessions, daemon=True).start()
     try:
         me = bot.get_me()
@@ -1455,7 +1554,7 @@ def main():
     except Exception as e:
         log.error(f"startup: {e}")
         return
-    bot.infinity_polling(skip_pending=True, timeout=30, interval=1)
+    bot.infinity_polling(skip_pending=True, timeout=30)
 
 
 if __name__ == "__main__":
@@ -1463,4 +1562,3 @@ if __name__ == "__main__":
         main()
     except (KeyboardInterrupt, SystemExit):
         log.info("stopped")
-PYEOF
