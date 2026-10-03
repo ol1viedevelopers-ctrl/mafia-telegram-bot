@@ -1,0 +1,7 @@
+.env
+bot.log
+stats.json
+stats.json.migrated
+mafia_stats.db
+__pycache__/
+*.pyc
